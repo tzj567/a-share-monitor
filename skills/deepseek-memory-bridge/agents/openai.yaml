@@ -1,0 +1,13 @@
+interface:
+  display_name: "DeepSeek Memory Bridge"
+  short_description: "Ground DeepSeek requests in reviewed project memory."
+  default_prompt: "Use $deepseek-memory-bridge to answer with reviewed project memory first, then call DeepSeek without importing raw sessions."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "dual-model-qa"
+      description: "Provides dual-model-qa/ask_model for provider: deepseek routing."
+
+policy:
+  allow_implicit_invocation: true
