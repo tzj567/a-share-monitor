@@ -1,0 +1,134 @@
+name: ashare-monitor-advanced
+
+x-flink-common: &flink-common
+  build:
+    context: ./flink-job
+  image: ashare-monitor/flink-job:0.3.0
+  environment:
+    FLINK_PROPERTIES: |
+      jobmanager.rpc.address: jobmanager
+      taskmanager.numberOfTaskSlots: 4
+      parallelism.default: 2
+      state.checkpoints.dir: file:///opt/flink/state/checkpoints
+      state.savepoints.dir: file:///opt/flink/state/savepoints
+      execution.checkpointing.externalized-checkpoint-retention: RETAIN_ON_CANCELLATION
+      web.cancel.enable: true
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_MARKET_TOPIC: ${KAFKA_MARKET_TOPIC:-ashare.market.bar.v1}
+    KAFKA_FUND_FLOW_TOPIC: ${KAFKA_FUND_FLOW_TOPIC:-ashare.fund-flow.v1}
+    KAFKA_NEWS_TOPIC: ${KAFKA_NEWS_TOPIC:-ashare.news.v1}
+    TDENGINE_DATABASE: ${TDENGINE_DATABASE:-ashare}
+    TDENGINE_JDBC_URL: jdbc:TAOS-WS://tdengine:6041/${TDENGINE_DATABASE:-ashare}?user=${TDENGINE_USER:-root}&password=${TDENGINE_PASSWORD:-taosdata}
+  volumes:
+    - flink-state:/opt/flink/state
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    ports:
+      - "19092:19092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command: |
+      for topic in "$${KAFKA_MARKET_TOPIC}" "$${KAFKA_FUND_FLOW_TOPIC}" "$${KAFKA_NEWS_TOPIC}"; do
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists --topic "$${topic}" --partitions 6 --replication-factor 1
+      done
+    environment:
+      KAFKA_MARKET_TOPIC: ${KAFKA_MARKET_TOPIC:-ashare.market.bar.v1}
+      KAFKA_FUND_FLOW_TOPIC: ${KAFKA_FUND_FLOW_TOPIC:-ashare.fund-flow.v1}
+      KAFKA_NEWS_TOPIC: ${KAFKA_NEWS_TOPIC:-ashare.news.v1}
+
+  tdengine:
+    image: tdengine/tsdb-ee:3.4.1.6
+    hostname: tdengine
+    ports:
+      - "6041:6041"
+    environment:
+      TAOS_FQDN: tdengine
+      TAOS_ROOT_PASSWORD: ${TDENGINE_PASSWORD:-taosdata}
+    volumes:
+      - tdengine-data:/var/lib/taos
+      - tdengine-log:/var/log/taos
+    healthcheck:
+      test: ["CMD-SHELL", "taos-check service"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    restart: unless-stopped
+
+  tdengine-init:
+    image: curlimages/curl:8.16.0
+    depends_on:
+      tdengine:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "/init.sh"]
+    environment:
+      TDENGINE_REST_URL: http://tdengine:6041
+      TDENGINE_DATABASE: ${TDENGINE_DATABASE:-ashare}
+      TDENGINE_USER: ${TDENGINE_USER:-root}
+      TDENGINE_PASSWORD: ${TDENGINE_PASSWORD:-taosdata}
+    volumes:
+      - ./tdengine/init.sh:/init.sh:ro
+      - ./tdengine/schema.sql:/schema.sql:ro
+
+  jobmanager:
+    <<: *flink-common
+    command: standalone-job --job-classname cn.ashare.monitor.MarketStreamJob
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      tdengine-init:
+        condition: service_completed_successfully
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/flink/bin/flink list -m localhost:8081 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  taskmanager:
+    <<: *flink-common
+    command: taskmanager
+    depends_on:
+      jobmanager:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  kafka-data:
+  tdengine-data:
+  tdengine-log:
+  flink-state:
